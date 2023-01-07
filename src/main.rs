@@ -12,6 +12,7 @@ use tower_lsp::jsonrpc::{ErrorCode, Result};
 use tower_lsp::lsp_types::notification::Notification;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tree_sitter::Node;
 
 pub const LEGEND_TYPE: &[SemanticTokenType] = &[
     SemanticTokenType::PROPERTY,
@@ -381,11 +382,65 @@ struct TextDocumentItem {
     text: String,
     version: i32,
 }
+
+fn get_node_errors(node: Node) -> Vec<Node> {
+    let mut ret = Vec::new();
+    let mut tree = node.walk();
+    let mut node = node;
+
+    loop {
+        if node.kind() == "ERROR" {
+            ret.push(node);
+        } else {
+            let mut tree = node.walk();
+            let has_child = tree.goto_first_child();
+            if has_child {
+                ret.append(&mut get_node_errors(tree.node()));
+            }
+        }
+        if tree.goto_next_sibling() {
+            node = tree.node();
+        } else {
+            break;
+        }
+    }
+    ret
+}
+
 impl Backend {
-    async fn on_change(&self, params: TextDocumentItem) {
+    async fn on_change<'a>(&self, params: TextDocumentItem) {
+        self.client
+            .log_message(MessageType::INFO, "on_change").await;
         let rope = ropey::Rope::from_str(&params.text);
         self.document_map
             .insert(params.uri.to_string(), rope.clone());
+
+        let doc = rope.to_string();
+
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(tree_sitter_hurl::language()).expect("Error loading hurl grammar");
+        let diagnostics = {
+            let tree = parser.parse(doc.as_str(), None).unwrap();
+            let query = tree_sitter::Query::new(tree_sitter_hurl::language(), "(ERROR) @error").expect("Error loading error query");
+            let mut query_cursor = tree_sitter::QueryCursor::new();
+            let matches = query_cursor.captures(&query, tree.root_node(), doc.as_bytes());
+
+            matches.map(| (m, index) | {
+                let capture = m.captures[index];
+                let start_position = capture.node.start_position();
+                let end_position = capture.node.end_position();
+                let start_position = Position::new(start_position.row.try_into().unwrap(), start_position.column.try_into().unwrap());
+                let end_position = Position::new(end_position.row.try_into().unwrap(), end_position.column.try_into().unwrap());
+                Diagnostic::new_simple(
+                    Range::new(start_position, end_position),
+                    "syntax error".to_string(),
+                )
+            }).collect::<Vec<_>>()
+        };
+        self.client
+            .publish_diagnostics(params.uri.clone(), diagnostics, Some(params.version))
+            .await;
+
         //let (ast, errors, semantic_tokens) = parse(&params.text);
         //self.client
         //    .log_message(MessageType::INFO, format!("{:?}", errors))
